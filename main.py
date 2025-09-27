@@ -1,5 +1,5 @@
 from fastapi import FastAPI, Request
-import os, json
+import json
 
 app = FastAPI()
 
@@ -9,38 +9,54 @@ def home():
 
 @app.post("/webhook/tv")
 async def webhook_tv(request: Request):
-    # --- 1) intenta JSON nativo ---
+    # Log de diagnóstico
+    headers = dict(request.headers)
+    raw_bytes = await request.body()
+    raw_text  = raw_bytes.decode("utf-8", errors="ignore").strip()
+
+    # Intentar parsear en este orden: JSON nativo -> form-encoded -> JSON en texto -> texto plano
+    data = None
     try:
         data = await request.json()
     except Exception:
-        # --- 2) intenta leer como texto ---
-        raw = (await request.body()).decode("utf-8", errors="ignore").strip()
+        pass
 
-        # a) si viene vacío -> error claro
-        if not raw:
-            return {"error": "Empty body from TradingView"}
-
-        # b) algunos servicios mandan 'payload=<json>' (form-encoded)
-        if raw.startswith("payload="):
-            raw = raw[len("payload="):]
-            raw = raw.replace("%7B", "{").replace("%7D", "}").replace("%22", '"')
-
-        # c) si parece JSON, parsea; si no, trata como texto ('buy', 'sell', etc.)
-        if raw.startswith("{") and raw.endswith("}"):
+    if data is None:
+        # ¿Formato form-encoded? (ej. payload=<json>)
+        if raw_text.startswith("payload="):
+            # decode básico urlencoded
+            cooked = (raw_text
+                      .replace("payload=", "")
+                      .replace("%7B","{").replace("%7D","}")
+                      .replace("%22",'"').replace("%20"," ")
+                      .replace("%3A",":").replace("%2C",","))
             try:
-                data = json.loads(raw)
+                data = json.loads(cooked)
             except Exception:
-                data = {"signal": raw}
+                data = {"signal": cooked}
+
+        # ¿JSON en texto?
+        elif raw_text.startswith("{") and raw_text.endswith("}"):
+            try:
+                data = json.loads(raw_text)
+            except Exception:
+                data = {"signal": raw_text}
         else:
-            data = {"signal": raw}
+            # Texto plano ('buy', 'sell', etc.)
+            data = {"signal": raw_text}
 
-    # ---- normaliza ----
-    signal = (str(data.get("signal") or "")).lower()
+    # Normalización
+    signal = str(data.get("signal") or "").lower()
     symbol = str(data.get("symbol") or "UNKNOWN")
-    price  = data.get("price")
+    price  = data.get("price", None)
 
-    if signal not in {"buy","sell","long","short","close","close_long","close_short"}:
-        return {"error": f"Invalid signal '{signal}'", "received": data}
+    # Respuesta y eco de depuración (para que veas exactamente qué llegó)
+    print("[TV DEBUG] content-type=", headers.get("content-type"),
+          "| raw_text=", raw_text,
+          "| parsed=", data)
 
-    print(f"[TV] signal={signal} symbol={symbol} price={price} data={data}")
-    return {"ok": True, "signal": signal, "symbol": symbol, "price": price}
+    return {
+        "ok": True,
+        "normalized": {"signal": signal, "symbol": symbol, "price": price},
+        "debug": {"content_type": headers.get("content-type"), "raw": raw_text}
+    }
