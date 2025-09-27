@@ -5,17 +5,17 @@ from zoneinfo import ZoneInfo
 app = FastAPI()
 
 # ===================== CONFIG =====================
-WHITELIST = set((os.getenv("WHITELIST","MES,ETHUSDT")).split(","))
-TZ = ZoneInfo(os.getenv("TZ","US/Eastern"))
-RTH_START = os.getenv("RTH_START","09:30")
-RTH_END   = os.getenv("RTH_END","15:45")
-DAILY_STOP = float(os.getenv("DAILY_STOP","-500"))
-DAILY_TAKE = float(os.getenv("DAILY_TAKE","250"))
-PAPER_MODE = os.getenv("PAPER_MODE","true").lower() == "true"
+WHITELIST = set((os.getenv("WHITELIST", "MES,ETHUSDT")).split(","))
+TZ = ZoneInfo(os.getenv("TZ", "US/Eastern"))
+RTH_START = os.getenv("RTH_START", "09:30")
+RTH_END = os.getenv("RTH_END", "15:45")
+DAILY_STOP = float(os.getenv("DAILY_STOP", "-500"))
+DAILY_TAKE = float(os.getenv("DAILY_TAKE", "250"))
+PAPER_MODE = os.getenv("PAPER_MODE", "true").lower() == "true"
 
-MYFXBOOK_USER = os.getenv("MYFXBOOK_USER","")
-MYFXBOOK_PASS = os.getenv("MYFXBOOK_PASS","")
-NEWS_LOOKAHEAD_HOURS = int(os.getenv("NEWS_LOOKAHEAD_HOURS","12"))
+MYFXBOOK_USER = os.getenv("MYFXBOOK_USER", "")
+MYFXBOOK_PASS = os.getenv("MYFXBOOK_PASS", "")
+NEWS_LOOKAHEAD_HOURS = int(os.getenv("NEWS_LOOKAHEAD_HOURS", "12"))
 
 # Estado persistente
 state = {
@@ -32,7 +32,7 @@ def in_rth(now_et: dt.datetime):
     s_h, s_m = map(int, RTH_START.split(":"))
     e_h, e_m = map(int, RTH_END.split(":"))
     t = now_et.time()
-    return (t >= dt.time(s_h,s_m)) and (t <= dt.time(e_h,e_m))
+    return (t >= dt.time(s_h, s_m)) and (t <= dt.time(e_h, e_m))
 
 def reset_if_new_day(now_et: dt.datetime):
     d = now_et.date()
@@ -43,12 +43,14 @@ def reset_if_new_day(now_et: dt.datetime):
         state["last_keys"].clear()
 
 def price_to_float(x):
-    try: return float(x)
-    except: return None
+    try:
+        return float(x)
+    except:
+        return None
 
 # ---- Flatten fin de sesión ----
 def maybe_flatten_eod(now_et):
-    if state.get("position") != 0 and (now_et.time() >= dt.time(15,44) and now_et.time() <= dt.time(15,45)):
+    if state.get("position") != 0 and (now_et.time() >= dt.time(15, 44) and now_et.time() <= dt.time(15, 45)):
         state["position"] = 0
         state["entry_price"] = None
         state["last_keys"].clear()
@@ -62,7 +64,7 @@ def update_heartbeat(now_et):
 
 def heartbeat_ok(now_et, max_minutes=10):
     hb = state.get("last_hb")
-    if hb is None: 
+    if hb is None:
         return True
     return (now_et - hb) <= dt.timedelta(minutes=max_minutes)
 
@@ -70,62 +72,94 @@ def heartbeat_ok(now_et, max_minutes=10):
 def fetch_myfxbook_news():
     """Conecta con Myfxbook y carga noticias impacto 2 y 3 estrellas"""
     if not MYFXBOOK_USER or not MYFXBOOK_PASS:
+        print("[NEWS] Credenciales no configuradas.")
         return []
 
-    # Login
-    login_url = "https://www.myfxbook.com/api/login.json"
-    session = requests.Session()
-    resp = session.get(login_url, params={"email": MYFXBOOK_USER, "password": MYFXBOOK_PASS})
-    data = resp.json()
-    if not data.get("error") == False:
-        print("[NEWS] Error login Myfxbook:", data)
-        return []
-    session_id = data.get("session")
+    try:
+        # -------- 1) Login --------
+        login_url = "https://www.myfxbook.com/api/login.json"
+        session = requests.Session()
+        resp = session.get(login_url, params={
+            "email": MYFXBOOK_USER,
+            "password": MYFXBOOK_PASS
+        }, timeout=10)
 
-    # Obtener calendario económico
-    cal_url = "https://www.myfxbook.com/api/get-economic-calendar.json"
-    now = dt.datetime.utcnow()
-    ahead = now + dt.timedelta(hours=NEWS_LOOKAHEAD_HOURS)
-    resp = session.get(cal_url, params={
-        "session": session_id,
-        "start": now.strftime("%Y-%m-%d %H:%M"),
-        "end": ahead.strftime("%Y-%m-%d %H:%M")
-    })
-    data = resp.json()
-    if data.get("error"):
-        print("[NEWS] Error calendario:", data)
-        return []
+        try:
+            data = resp.json()
+        except:
+            print("[NEWS] Login no devolvió JSON. Respuesta cruda:", resp.text[:500])
+            return []
 
-    news_list = []
-    for item in data.get("calendar", []):
-        impact = item.get("impact")
-        # Myfxbook: 1=low, 2=medium, 3=high
-        if impact in [2,3]:
-            event_time = dt.datetime.fromtimestamp(item["timestamp"]/1000, tz=TZ)
-            start = event_time - dt.timedelta(minutes=30)
-            end   = event_time + dt.timedelta(minutes=60)
-            news_list.append((start, end, item.get("title","")))
-    return news_list
+        if data.get("error"):
+            print("[NEWS] Error login Myfxbook:", data)
+            return []
+
+        session_id = data.get("session")
+        print(f"[NEWS] Login OK. Session ID: {session_id}")
+
+        # -------- 2) Obtener calendario --------
+        cal_url = "https://www.myfxbook.com/api/get-economic-calendar.json"
+        now = dt.datetime.utcnow()
+        ahead = now + dt.timedelta(hours=NEWS_LOOKAHEAD_HOURS)
+
+        print(f"[DEBUG] Requesting calendar from {now} to {ahead}")
+        resp = session.get(cal_url, params={
+            "session": session_id,
+            "start": now.strftime("%Y-%m-%d %H:%M"),
+            "end": ahead.strftime("%Y-%m-%d %H:%M")
+        }, timeout=10)
+
+        # Si no devuelve JSON, mostrar respuesta cruda
+        if "application/json" not in resp.headers.get("Content-Type", ""):
+            print("[DEBUG] Calendar raw response (no JSON):", resp.text[:500])
+            return []
+
+        data = resp.json()
+
+        if data.get("error"):
+            print("[NEWS] Error calendario:", data)
+            return []
+
+        # -------- 3) Procesar noticias --------
+        news_list = []
+        for item in data.get("calendar", []):
+            impact = item.get("impact")
+            # Myfxbook: 1=low, 2=medium, 3=high
+            if impact in [2, 3]:
+                event_time = dt.datetime.fromtimestamp(item["timestamp"]/1000, tz=TZ)
+                start = event_time - dt.timedelta(minutes=30)
+                end = event_time + dt.timedelta(minutes=60)
+                title = item.get("title", "Evento sin título")
+                news_list.append((start, end, title))
+                print(f"[NEWS] {event_time} | Impacto {impact} | {title}")
+
+        print(f"[NEWS] Total eventos cargados: {len(news_list)}")
+        return news_list
+
+    except Exception as e:
+        print("[NEWS] Error general:", str(e))
+        return []
 
 def refresh_news():
     state["news_windows"] = fetch_myfxbook_news()
-    print(f"[NEWS] Ventanas actualizadas: {len(state['news_windows'])} eventos")
+    print(f"[NEWS] Ventanas activas: {len(state['news_windows'])}")
 
 def in_news_window(now_et):
-    for (s,e,_) in state["news_windows"]:
+    for (s, e, title) in state["news_windows"]:
         if s <= now_et <= e:
+            print(f"[BLOCK] Operación bloqueada por noticia: {title}")
             return True
     return False
 
 # ===================== TRADOVATE STUB =====================
-def place_tradovate_order(symbol: str, side: str, qty: int, price: float|None=None):
+def place_tradovate_order(symbol: str, side: str, qty: int, price: float | None = None):
     print(f"[TRADOVATE] {side.upper()} {qty} {symbol} @ {price or 'MKT'}")
     return {"ok": True, "orderId": "sim-123"}
 
 # ===================== WEBHOOK =====================
 @app.post("/webhook/tv")
 async def webhook_tv(request: Request):
-    raw = (await request.body()).decode("utf-8","ignore").strip()
+    raw = (await request.body()).decode("utf-8", "ignore").strip()
     try:
         data = await request.json()
     except:
@@ -133,8 +167,8 @@ async def webhook_tv(request: Request):
 
     symbol = str(data.get("symbol") or "").upper()
     signal = str(data.get("signal") or "").lower()
-    price  = price_to_float(data.get("price"))
-    tstr   = str(data.get("time") or "")
+    price = price_to_float(data.get("price"))
+    tstr = str(data.get("time") or "")
     now_et = dt.datetime.now(TZ)
 
     # Actualizar heartbeat
@@ -213,7 +247,7 @@ async def webhook_tv(request: Request):
         "price": price,
         "state": {
             "position": state["position"],
-            "daily_pnl": round(state["daily_pnl"],2),
+            "daily_pnl": round(state["daily_pnl"], 2),
             "date": str(state["date"]),
         },
         "exec": exec_info
@@ -223,4 +257,8 @@ async def webhook_tv(request: Request):
 @app.on_event("startup")
 async def startup_event():
     print("[INIT] Cargando noticias iniciales...")
-    refresh_news()
+    try:
+        refresh_news()
+    except Exception as e:
+        print("[INIT] Error inicializando noticias:", str(e))
+        state["news_windows"] = []
