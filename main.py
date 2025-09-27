@@ -1,5 +1,5 @@
 from fastapi import FastAPI, Request
-import os, json, datetime as dt
+import os, json, datetime as dt, requests
 from zoneinfo import ZoneInfo
 
 app = FastAPI()
@@ -13,13 +13,18 @@ DAILY_STOP = float(os.getenv("DAILY_STOP","-500"))
 DAILY_TAKE = float(os.getenv("DAILY_TAKE","250"))
 PAPER_MODE = os.getenv("PAPER_MODE","true").lower() == "true"
 
-# Estado persistente en memoria
+MYFXBOOK_USER = os.getenv("MYFXBOOK_USER","")
+MYFXBOOK_PASS = os.getenv("MYFXBOOK_PASS","")
+NEWS_LOOKAHEAD_HOURS = int(os.getenv("NEWS_LOOKAHEAD_HOURS","12"))
+
+# Estado persistente
 state = {
     "date": None,
     "daily_pnl": 0.0,
     "position": 0,
     "last_keys": set(),
-    "last_hb": None
+    "last_hb": None,
+    "news_windows": []
 }
 
 # ===================== HELPERS =====================
@@ -61,32 +66,58 @@ def heartbeat_ok(now_et, max_minutes=10):
         return True
     return (now_et - hb) <= dt.timedelta(minutes=max_minutes)
 
-# ---- Noticias manuales ----
-def load_news():
-    raw = os.getenv("NEWS_WINDOWS","").strip()
-    if not raw: return []
-    pairs = []
-    for rng in raw.split(","):
-        if "/" in rng:
-            a,b = rng.split("/",1)
-            try:
-                start = dt.datetime.fromisoformat(a).replace(tzinfo=TZ)
-                end   = dt.datetime.fromisoformat(b).replace(tzinfo=TZ)
-                pairs.append((start, end))
-            except: pass
-    pre  = int(os.getenv("NEWS_PADDING_PRE_MIN","30"))
-    post = int(os.getenv("NEWS_PADDING_POST_MIN","60"))
-    return [(s - dt.timedelta(minutes=pre), e + dt.timedelta(minutes=post)) for (s,e) in pairs]
+# ===================== MYFXBOOK NEWS =====================
+def fetch_myfxbook_news():
+    """Conecta con Myfxbook y carga noticias impacto 2 y 3 estrellas"""
+    if not MYFXBOOK_USER or not MYFXBOOK_PASS:
+        return []
 
-NEWS_WINDOWS = load_news()
+    # Login
+    login_url = "https://www.myfxbook.com/api/login.json"
+    session = requests.Session()
+    resp = session.get(login_url, params={"email": MYFXBOOK_USER, "password": MYFXBOOK_PASS})
+    data = resp.json()
+    if not data.get("error") == False:
+        print("[NEWS] Error login Myfxbook:", data)
+        return []
+    session_id = data.get("session")
+
+    # Obtener calendario económico
+    cal_url = "https://www.myfxbook.com/api/get-economic-calendar.json"
+    now = dt.datetime.utcnow()
+    ahead = now + dt.timedelta(hours=NEWS_LOOKAHEAD_HOURS)
+    resp = session.get(cal_url, params={
+        "session": session_id,
+        "start": now.strftime("%Y-%m-%d %H:%M"),
+        "end": ahead.strftime("%Y-%m-%d %H:%M")
+    })
+    data = resp.json()
+    if data.get("error"):
+        print("[NEWS] Error calendario:", data)
+        return []
+
+    news_list = []
+    for item in data.get("calendar", []):
+        impact = item.get("impact")
+        # Myfxbook: 1=low, 2=medium, 3=high
+        if impact in [2,3]:
+            event_time = dt.datetime.fromtimestamp(item["timestamp"]/1000, tz=TZ)
+            start = event_time - dt.timedelta(minutes=30)
+            end   = event_time + dt.timedelta(minutes=60)
+            news_list.append((start, end, item.get("title","")))
+    return news_list
+
+def refresh_news():
+    state["news_windows"] = fetch_myfxbook_news()
+    print(f"[NEWS] Ventanas actualizadas: {len(state['news_windows'])} eventos")
 
 def in_news_window(now_et):
-    for (s,e) in NEWS_WINDOWS:
+    for (s,e,_) in state["news_windows"]:
         if s <= now_et <= e:
             return True
     return False
 
-# ---- Tradovate stub ----
+# ===================== TRADOVATE STUB =====================
 def place_tradovate_order(symbol: str, side: str, qty: int, price: float|None=None):
     print(f"[TRADOVATE] {side.upper()} {qty} {symbol} @ {price or 'MKT'}")
     return {"ok": True, "orderId": "sim-123"}
@@ -98,18 +129,7 @@ async def webhook_tv(request: Request):
     try:
         data = await request.json()
     except:
-        if raw.startswith("payload="):
-            cooked = (raw.replace("payload=","")
-                        .replace("%7B","{").replace("%7D","}")
-                        .replace("%22",'"').replace("%20"," ")
-                        .replace("%3A",":").replace("%2C",","))
-            try: data = json.loads(cooked)
-            except: data = {"signal": raw}
-        elif raw.startswith("{") and raw.endswith("}"):
-            try: data = json.loads(raw)
-            except: data = {"signal": raw}
-        else:
-            data = {"signal": raw}
+        data = {"signal": raw}
 
     symbol = str(data.get("symbol") or "").upper()
     signal = str(data.get("signal") or "").lower()
@@ -133,7 +153,7 @@ async def webhook_tv(request: Request):
         if maybe_flatten_eod(now_et):
             return {"ok": False, "reason": "eod_flatten"}
 
-    # 4) Chequeo heartbeat
+    # 4) Heartbeat
     if symbol == "MES" and not heartbeat_ok(now_et, max_minutes=10):
         return {"ok": False, "reason": "heartbeat_timeout"}
 
@@ -198,3 +218,9 @@ async def webhook_tv(request: Request):
         },
         "exec": exec_info
     }
+
+# ===================== STARTUP =====================
+@app.on_event("startup")
+async def startup_event():
+    print("[INIT] Cargando noticias iniciales...")
+    refresh_news()
