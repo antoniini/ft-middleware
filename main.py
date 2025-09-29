@@ -1,6 +1,7 @@
 # main.py
 from fastapi import FastAPI, Request, Header, HTTPException
-import os, datetime as dt
+from fastapi.responses import StreamingResponse
+import os, datetime as dt, io, csv
 from zoneinfo import ZoneInfo
 
 app = FastAPI()
@@ -26,6 +27,12 @@ state = {
     "last_keys": set(),
     "last_hb": None,
 }
+
+# ===================== ORDENES (AUDITORÍA EN MEMORIA) =====================
+orders = []  # [{id, symbol, side, qty, price, time, mode}]
+
+def next_order_id() -> str:
+    return f"sim-{len(orders)+1:04d}"
 
 # ===================== HELPERS =====================
 def in_rth(now_et: dt.datetime) -> bool:
@@ -72,12 +79,28 @@ def _require_admin(x_token: str | None):
     if ADMIN_TOKEN and (x_token or "") != ADMIN_TOKEN:
         raise HTTPException(status_code=401, detail="invalid admin token")
 
-# ===================== LIVE EXEC (stub) =====================
+# ===================== EJECUCIÓN (stub con AUDITORÍA) =====================
 def place_order(symbol: str, side: str, qty: int, price: float | None = None):
-    print(f"[LIVE EXEC] {side.upper()} {qty} {symbol} @ {price or 'MKT'}")
-    return {"ok": True, "orderId": "sim-001"}
+    """
+    Simula ejecución y guarda orden en memoria para auditoría.
+    Conecta aquí a Tradovate para live cuando quieras.
+    """
+    ts = dt.datetime.now(TZ).isoformat()
+    order = {
+        "id": next_order_id(),
+        "symbol": symbol,
+        "side": side.upper(),
+        "qty": qty,
+        "price": price if price is not None else "MKT",
+        "time": ts,
+        "mode": "paper" if PAPER_MODE else "live"
+    }
+    orders.append(order)
+    tag = "PAPER EXEC" if PAPER_MODE else "LIVE EXEC"
+    print(f"[{tag}] {order['side']} {order['qty']} {order['symbol']} @ {order['price']} | id={order['id']}")
+    return {"ok": True, "orderId": order["id"]}
 
-# ===================== ENDPOINTS =====================
+# ===================== ENDPOINTS PRINCIPALES =====================
 @app.post("/webhook/tv")
 async def webhook_tv(request: Request):
     raw = (await request.body()).decode("utf-8", "ignore").strip()
@@ -127,7 +150,7 @@ async def webhook_tv(request: Request):
     state["last_keys"].add(key)
 
     exec_info = {"mode": "paper" if PAPER_MODE else "live"}
-    point_mult = 5.0  # ajustable
+    point_mult = 5.0  # ajusta si quieres otra convención
 
     if signal == "buy":
         if state["position"] < 1:
@@ -137,10 +160,7 @@ async def webhook_tv(request: Request):
                 print(f"[PnL] Cierre SHORT PnL={pnl:.2f} | DailyPnL={state['daily_pnl']:.2f}")
             state["position"] = 1
             state["entry_price"] = price
-            if PAPER_MODE:
-                print(f"[PAPER EXEC] BUY 1 {symbol} @ {price or 'MKT'}")
-            else:
-                exec_info = place_order(symbol, "buy", 1, price)
+            exec_info = place_order(symbol, "buy", 1, price)
 
     elif signal == "sell":
         if state["position"] > -1:
@@ -150,10 +170,7 @@ async def webhook_tv(request: Request):
                 print(f"[PnL] Cierre LONG PnL={pnl:.2f} | DailyPnL={state['daily_pnl']:.2f}")
             state["position"] = -1
             state["entry_price"] = price
-            if PAPER_MODE:
-                print(f"[PAPER EXEC] SELL 1 {symbol} @ {price or 'MKT'}")
-            else:
-                exec_info = place_order(symbol, "sell", 1, price)
+            exec_info = place_order(symbol, "sell", 1, price)
     else:
         print(f"[BLOCK] Invalid signal: {signal}")
         return {"ok": False, "reason": "invalid_signal", "got": signal}
@@ -208,19 +225,30 @@ def health():
 def home():
     return {"status": "ok", "msg": "FT middleware running"}
 
-# ===== EXTRA: endpoints de prueba de logs =====
-@app.get("/logs/test")
-def logs_test():
-    now = dt.datetime.now(TZ).isoformat()
-    print(f"[TEST] Ping de logs a las {now}")
-    return {"ok": True, "msg": "test log written", "time": now}
+# ===================== ENDPOINTS DE AUDITORÍA =====================
+@app.get("/orders")
+def get_orders():
+    """Devuelve historial de órdenes (en memoria)."""
+    return {"ok": True, "count": len(orders), "orders": orders}
 
-@app.post("/logs/echo")
-async def logs_echo(request: Request):
-    raw = (await request.body()).decode("utf-8", "ignore")
-    print(f"[ECHO] {raw}")
-    try:
-        data = await request.json()
-    except:
-        data = {"raw": raw}
-    return {"ok": True, "echo": data}
+@app.post("/orders/reset")
+def reset_orders():
+    """Limpia el historial de órdenes."""
+    orders.clear()
+    print("[ORDERS] Reset de historial")
+    return {"ok": True, "cleared": True}
+
+@app.get("/orders/export")
+def export_orders_csv():
+    """Exporta el historial de órdenes a CSV (descarga)."""
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow(["id", "symbol", "side", "qty", "price", "time", "mode"])
+    for o in orders:
+        writer.writerow([o["id"], o["symbol"], o["side"], o["qty"], o["price"], o["time"], o["mode"]])
+    output.seek(0)
+    filename = f"orders_{dt.datetime.now(TZ).strftime('%Y%m%d_%H%M%S')}.csv"
+    headers = {
+        "Content-Disposition": f'attachment; filename="{filename}"'
+    }
+    return StreamingResponse(iter([output.getvalue()]), media_type="text/csv", headers=headers)
