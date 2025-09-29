@@ -6,27 +6,25 @@ from zoneinfo import ZoneInfo
 app = FastAPI()
 
 # ===================== CONFIG =====================
-# Puedes sobreescribir con variables de entorno en Render → Environment
 WHITELIST   = set((os.getenv("WHITELIST", "CME_MINI:MES1!,MES,ETHUSDT")).split(","))
 TZ          = ZoneInfo(os.getenv("TZ", "US/Eastern"))
-RTH_START   = os.getenv("RTH_START", "09:30")   # HH:MM (ET) MES RTH
-RTH_END     = os.getenv("RTH_END", "15:45")     # HH:MM (ET) MES RTH
+RTH_START   = os.getenv("RTH_START", "09:30")
+RTH_END     = os.getenv("RTH_END", "15:45")
 DAILY_STOP  = float(os.getenv("DAILY_STOP", "-500"))
 DAILY_TAKE  = float(os.getenv("DAILY_TAKE", "250"))
 PAPER_MODE  = os.getenv("PAPER_MODE", "true").lower() == "true"
 
-# Token opcional para /enable y /disable. Si está vacío, NO se valida.
-ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "")
+ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "")  # si vacío, /enable y /disable no piden token
 
 # ===================== STATE =====================
 state = {
-    "enabled": True,        # << switch maestro ON/OFF
+    "enabled": True,
     "date": None,
     "daily_pnl": 0.0,
-    "position": 0,          # -1 short, 0 flat, 1 long
+    "position": 0,
     "entry_price": None,
-    "last_keys": set(),     # dedupe por (symbol|signal|time)
-    "last_hb": None,        # último heartbeat recibido
+    "last_keys": set(),
+    "last_hb": None,
 }
 
 # ===================== HELPERS =====================
@@ -44,6 +42,7 @@ def reset_if_new_day(now_et: dt.datetime):
         state["position"] = 0
         state["entry_price"] = None
         state["last_keys"].clear()
+        print(f"[RESET] Nuevo día {d} ET. PnL=0, pos cerrada.")
 
 def price_to_float(x):
     try:
@@ -52,12 +51,11 @@ def price_to_float(x):
         return None
 
 def maybe_flatten_eod(now_et: dt.datetime) -> bool:
-    """Cierra toda posición entre 15:44–15:45 ET (seguridad)."""
     if state.get("position") != 0 and dt.time(15, 44) <= now_et.time() <= dt.time(15, 45):
+        print("[RISK] EOD flatten ejecutado")
         state["position"] = 0
         state["entry_price"] = None
         state["last_keys"].clear()
-        print("[RISK] EOD flatten ejecutado")
         return True
     return False
 
@@ -71,20 +69,17 @@ def heartbeat_ok(now_et: dt.datetime, max_minutes=10) -> bool:
     return (now_et - hb) <= dt.timedelta(minutes=max_minutes)
 
 def _require_admin(x_token: str | None):
-    # si ADMIN_TOKEN está vacío, no exigimos header
     if ADMIN_TOKEN and (x_token or "") != ADMIN_TOKEN:
         raise HTTPException(status_code=401, detail="invalid admin token")
 
-# ===================== EJECUCIÓN (stub) =====================
+# ===================== LIVE EXEC (stub) =====================
 def place_order(symbol: str, side: str, qty: int, price: float | None = None):
-    """Conectar aquí a Tradovate para live. Ahora solo imprime."""
-    print(f"[EXEC] {side.upper()} {qty} {symbol} @ {price or 'MKT'} | mode={'paper' if PAPER_MODE else 'live'}")
+    print(f"[LIVE EXEC] {side.upper()} {qty} {symbol} @ {price or 'MKT'}")
     return {"ok": True, "orderId": "sim-001"}
 
 # ===================== ENDPOINTS =====================
 @app.post("/webhook/tv")
 async def webhook_tv(request: Request):
-    # Intentar JSON; si no, tomar body como texto (buy/sell)
     raw = (await request.body()).decode("utf-8", "ignore").strip()
     try:
         data = await request.json()
@@ -97,56 +92,54 @@ async def webhook_tv(request: Request):
     tstr   = str(data.get("time") or "")
     now_et = dt.datetime.now(TZ)
 
+    print(f"[WEBHOOK] symbol={symbol} signal={signal} price={price} time={tstr}")
     update_heartbeat(now_et)
 
-    # 0) Switch maestro
     if not state["enabled"]:
+        print("[BLOCK] Bot disabled")
         return {"ok": False, "reason": "disabled"}
 
-    # 1) Permitir solo símbolos whitelisted
     if symbol not in WHITELIST:
+        print(f"[BLOCK] Symbol not allowed: {symbol}")
         return {"ok": False, "reason": "symbol_not_allowed", "symbol": symbol}
 
-    # 2) Reset diario y reglas específicas para MES (futuros)
     if symbol in ("MES", "CME_MINI:MES1!"):
         reset_if_new_day(now_et)
-
-        # EOD flatten forzoso
         if maybe_flatten_eod(now_et):
             return {"ok": False, "reason": "eod_flatten"}
-
-        # Heartbeat: si TV se “muere”, paramos
         if not heartbeat_ok(now_et, max_minutes=10):
+            print("[BLOCK] Heartbeat timeout")
             return {"ok": False, "reason": "heartbeat_timeout"}
-
-        # Solo RTH
         if not in_rth(now_et):
+            print("[BLOCK] Outside RTH")
             return {"ok": False, "reason": "outside_rth"}
-
-        # Límites diarios (simulados)
         if state["daily_pnl"] <= DAILY_STOP:
+            print("[BLOCK] Daily stop reached")
             return {"ok": False, "reason": "daily_stop_reached"}
         if state["daily_pnl"] >= DAILY_TAKE:
+            print("[BLOCK] Daily take reached")
             return {"ok": False, "reason": "daily_take_reached"}
 
-    # 3) Dedupe por (symbol|signal|time)
     key = f"{symbol}|{signal}|{tstr}"
     if key in state["last_keys"]:
+        print("[BLOCK] Duplicate signal")
         return {"ok": False, "reason": "duplicate"}
     state["last_keys"].add(key)
 
-    # 4) Ejecución + PnL simulado (multiplicador aproximado)
     exec_info = {"mode": "paper" if PAPER_MODE else "live"}
-    point_mult = 5.0  # ajusta si quieres otra convención
+    point_mult = 5.0  # ajustable
 
     if signal == "buy":
         if state["position"] < 1:
             if state["position"] == -1 and price:
                 pnl = (state.get("entry_price", price) - price) * point_mult
                 state["daily_pnl"] += pnl
-            state["position"]  = 1
+                print(f"[PnL] Cierre SHORT PnL={pnl:.2f} | DailyPnL={state['daily_pnl']:.2f}")
+            state["position"] = 1
             state["entry_price"] = price
-            if not PAPER_MODE:
+            if PAPER_MODE:
+                print(f"[PAPER EXEC] BUY 1 {symbol} @ {price or 'MKT'}")
+            else:
                 exec_info = place_order(symbol, "buy", 1, price)
 
     elif signal == "sell":
@@ -154,12 +147,15 @@ async def webhook_tv(request: Request):
             if state["position"] == 1 and price:
                 pnl = (price - state.get("entry_price", price)) * point_mult
                 state["daily_pnl"] += pnl
-            state["position"]  = -1
+                print(f"[PnL] Cierre LONG PnL={pnl:.2f} | DailyPnL={state['daily_pnl']:.2f}")
+            state["position"] = -1
             state["entry_price"] = price
-            if not PAPER_MODE:
+            if PAPER_MODE:
+                print(f"[PAPER EXEC] SELL 1 {symbol} @ {price or 'MKT'}")
+            else:
                 exec_info = place_order(symbol, "sell", 1, price)
-
     else:
+        print(f"[BLOCK] Invalid signal: {signal}")
         return {"ok": False, "reason": "invalid_signal", "got": signal}
 
     return {
@@ -177,20 +173,20 @@ async def webhook_tv(request: Request):
         "exec": exec_info
     }
 
-# ---- ON / OFF (si ADMIN_TOKEN está vacío, no se exige header) ----
 @app.post("/enable")
 def enable_bot(x_admin_token: str | None = Header(default=None, convert_underscores=False)):
     _require_admin(x_admin_token)
     state["enabled"] = True
+    print("[ADMIN] Bot ENABLED")
     return {"ok": True, "enabled": True}
 
 @app.post("/disable")
 def disable_bot(x_admin_token: str | None = Header(default=None, convert_underscores=False)):
     _require_admin(x_admin_token)
     state["enabled"] = False
+    print("[ADMIN] Bot DISABLED")
     return {"ok": True, "enabled": False}
 
-# ---- Estado / Health ----
 @app.get("/health")
 def health():
     return {
@@ -211,3 +207,20 @@ def health():
 @app.get("/")
 def home():
     return {"status": "ok", "msg": "FT middleware running"}
+
+# ===== EXTRA: endpoints de prueba de logs =====
+@app.get("/logs/test")
+def logs_test():
+    now = dt.datetime.now(TZ).isoformat()
+    print(f"[TEST] Ping de logs a las {now}")
+    return {"ok": True, "msg": "test log written", "time": now}
+
+@app.post("/logs/echo")
+async def logs_echo(request: Request):
+    raw = (await request.body()).decode("utf-8", "ignore")
+    print(f"[ECHO] {raw}")
+    try:
+        data = await request.json()
+    except:
+        data = {"raw": raw}
+    return {"ok": True, "echo": data}
