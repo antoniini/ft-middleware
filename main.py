@@ -1,30 +1,30 @@
-from fastapi import FastAPI, Request
-import os, json, datetime as dt, requests
+from fastapi import FastAPI, Request, Header, HTTPException
+import os, datetime as dt
 from zoneinfo import ZoneInfo
 
 app = FastAPI()
 
 # ===================== CONFIG =====================
-WHITELIST = set((os.getenv("WHITELIST", "MES,ETHUSDT")).split(","))
-TZ = ZoneInfo(os.getenv("TZ", "US/Eastern"))
-RTH_START = os.getenv("RTH_START", "09:30")
-RTH_END = os.getenv("RTH_END", "15:45")
-DAILY_STOP = float(os.getenv("DAILY_STOP", "-500"))
-DAILY_TAKE = float(os.getenv("DAILY_TAKE", "250"))
-PAPER_MODE = os.getenv("PAPER_MODE", "true").lower() == "true"
+WHITELIST   = set((os.getenv("WHITELIST", "MES,ETHUSDT")).split(","))
+TZ          = ZoneInfo(os.getenv("TZ", "US/Eastern"))
+RTH_START   = os.getenv("RTH_START", "09:30")      # HH:MM
+RTH_END     = os.getenv("RTH_END", "15:45")        # HH:MM
+DAILY_STOP  = float(os.getenv("DAILY_STOP", "-500"))
+DAILY_TAKE  = float(os.getenv("DAILY_TAKE", "250"))
+PAPER_MODE  = os.getenv("PAPER_MODE", "true").lower() == "true"
 
-MYFXBOOK_USER = os.getenv("MYFXBOOK_USER", "")
-MYFXBOOK_PASS = os.getenv("MYFXBOOK_PASS", "")
-NEWS_LOOKAHEAD_HOURS = int(os.getenv("NEWS_LOOKAHEAD_HOURS", "12"))
+# Protección simple para endpoints de /enable y /disable (opcional)
+ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "")         # si está vacío, no se valida
 
-# Estado persistente
+# ===================== STATE =====================
 state = {
+    "enabled": True,           # << switch maestro
     "date": None,
     "daily_pnl": 0.0,
-    "position": 0,
-    "last_keys": set(),
-    "last_hb": None,
-    "news_windows": []
+    "position": 0,             # -1 short, 0 flat, 1 long
+    "entry_price": None,
+    "last_keys": set(),        # dedupe por barra
+    "last_hb": None,           # heartbeat del último webhook
 }
 
 # ===================== HELPERS =====================
@@ -40,6 +40,7 @@ def reset_if_new_day(now_et: dt.datetime):
         state["date"] = d
         state["daily_pnl"] = 0.0
         state["position"] = 0
+        state["entry_price"] = None
         state["last_keys"].clear()
 
 def price_to_float(x):
@@ -48,9 +49,9 @@ def price_to_float(x):
     except:
         return None
 
-# ---- Flatten fin de sesión ----
-def maybe_flatten_eod(now_et):
-    if state.get("position") != 0 and (now_et.time() >= dt.time(15, 44) and now_et.time() <= dt.time(15, 45)):
+def maybe_flatten_eod(now_et: dt.datetime):
+    """Cierra todo entre 15:44–15:45 ET (por seguridad)."""
+    if state.get("position") != 0 and dt.time(15, 44) <= now_et.time() <= dt.time(15, 45):
         state["position"] = 0
         state["entry_price"] = None
         state["last_keys"].clear()
@@ -58,107 +59,25 @@ def maybe_flatten_eod(now_et):
         return True
     return False
 
-# ---- Heartbeat ----
-def update_heartbeat(now_et):
+def update_heartbeat(now_et: dt.datetime):
     state["last_hb"] = now_et
 
-def heartbeat_ok(now_et, max_minutes=10):
+def heartbeat_ok(now_et: dt.datetime, max_minutes=10):
     hb = state.get("last_hb")
     if hb is None:
         return True
     return (now_et - hb) <= dt.timedelta(minutes=max_minutes)
 
-# ===================== MYFXBOOK NEWS =====================
-def fetch_myfxbook_news():
-    """Conecta con Myfxbook y carga noticias impacto 2 y 3 estrellas"""
-    if not MYFXBOOK_USER or not MYFXBOOK_PASS:
-        print("[NEWS] Credenciales no configuradas.")
-        return []
+# ===================== EXECUTION STUB =====================
+def place_order(symbol: str, side: str, qty: int, price: float | None = None):
+    """Aquí conectaríamos Tradovate en vivo. Por ahora sólo loguea."""
+    print(f"[EXEC] {side.upper()} {qty} {symbol} @ {price or 'MKT'} | mode={'paper' if PAPER_MODE else 'live'}")
+    return {"ok": True, "orderId": "sim-001"}
 
-    try:
-        # -------- 1) Login --------
-        login_url = "https://www.myfxbook.com/api/login.json"
-        session = requests.Session()
-        resp = session.get(login_url, params={
-            "email": MYFXBOOK_USER,
-            "password": MYFXBOOK_PASS
-        }, timeout=10)
-
-        try:
-            data = resp.json()
-        except:
-            print("[NEWS] Login no devolvió JSON. Respuesta cruda:", resp.text[:500])
-            return []
-
-        if data.get("error"):
-            print("[NEWS] Error login Myfxbook:", data)
-            return []
-
-        session_id = data.get("session")
-        print(f"[NEWS] Login OK. Session ID: {session_id}")
-
-        # -------- 2) Obtener calendario --------
-        cal_url = "https://www.myfxbook.com/api/get-economic-calendar.json"
-        now = dt.datetime.utcnow()
-        ahead = now + dt.timedelta(hours=NEWS_LOOKAHEAD_HOURS)
-
-        print(f"[DEBUG] Requesting calendar from {now} to {ahead}")
-        resp = session.get(cal_url, params={
-            "session": session_id,
-            "start": now.strftime("%Y-%m-%d %H:%M"),
-            "end": ahead.strftime("%Y-%m-%d %H:%M")
-        }, timeout=10)
-
-        # Si no devuelve JSON, mostrar respuesta cruda
-        if "application/json" not in resp.headers.get("Content-Type", ""):
-            print("[DEBUG] Calendar raw response (no JSON):", resp.text[:500])
-            return []
-
-        data = resp.json()
-
-        if data.get("error"):
-            print("[NEWS] Error calendario:", data)
-            return []
-
-        # -------- 3) Procesar noticias --------
-        news_list = []
-        for item in data.get("calendar", []):
-            impact = item.get("impact")
-            # Myfxbook: 1=low, 2=medium, 3=high
-            if impact in [2, 3]:
-                event_time = dt.datetime.fromtimestamp(item["timestamp"]/1000, tz=TZ)
-                start = event_time - dt.timedelta(minutes=30)
-                end = event_time + dt.timedelta(minutes=60)
-                title = item.get("title", "Evento sin título")
-                news_list.append((start, end, title))
-                print(f"[NEWS] {event_time} | Impacto {impact} | {title}")
-
-        print(f"[NEWS] Total eventos cargados: {len(news_list)}")
-        return news_list
-
-    except Exception as e:
-        print("[NEWS] Error general:", str(e))
-        return []
-
-def refresh_news():
-    state["news_windows"] = fetch_myfxbook_news()
-    print(f"[NEWS] Ventanas activas: {len(state['news_windows'])}")
-
-def in_news_window(now_et):
-    for (s, e, title) in state["news_windows"]:
-        if s <= now_et <= e:
-            print(f"[BLOCK] Operación bloqueada por noticia: {title}")
-            return True
-    return False
-
-# ===================== TRADOVATE STUB =====================
-def place_tradovate_order(symbol: str, side: str, qty: int, price: float | None = None):
-    print(f"[TRADOVATE] {side.upper()} {qty} {symbol} @ {price or 'MKT'}")
-    return {"ok": True, "orderId": "sim-123"}
-
-# ===================== WEBHOOK =====================
+# ===================== API =====================
 @app.post("/webhook/tv")
 async def webhook_tv(request: Request):
+    # leer body en texto; si no es json válido, tratamos como texto simple ("buy"/"sell")
     raw = (await request.body()).decode("utf-8", "ignore").strip()
     try:
         data = await request.json()
@@ -167,14 +86,17 @@ async def webhook_tv(request: Request):
 
     symbol = str(data.get("symbol") or "").upper()
     signal = str(data.get("signal") or "").lower()
-    price = price_to_float(data.get("price"))
-    tstr = str(data.get("time") or "")
+    price  = price_to_float(data.get("price"))
+    tstr   = str(data.get("time") or "")
     now_et = dt.datetime.now(TZ)
 
-    # Actualizar heartbeat
     update_heartbeat(now_et)
 
-    # 1) Solo símbolos permitidos
+    # 0) Switch maestro
+    if not state["enabled"]:
+        return {"ok": False, "reason": "disabled"}
+
+    # 1) Símbolos permitidos
     if symbol not in WHITELIST:
         return {"ok": False, "reason": "symbol_not_allowed", "symbol": symbol}
 
@@ -182,61 +104,56 @@ async def webhook_tv(request: Request):
     if symbol == "MES":
         reset_if_new_day(now_et)
 
-    # 3) Flatten EOD
-    if symbol == "MES":
-        if maybe_flatten_eod(now_et):
-            return {"ok": False, "reason": "eod_flatten"}
+    # 3) EOD flatten forzoso
+    if symbol == "MES" and maybe_flatten_eod(now_et):
+        return {"ok": False, "reason": "eod_flatten"}
 
-    # 4) Heartbeat
+    # 4) Heartbeat (si TV deja de mandar, frenamos)
     if symbol == "MES" and not heartbeat_ok(now_et, max_minutes=10):
         return {"ok": False, "reason": "heartbeat_timeout"}
 
-    # 5) Bloqueo por noticias
-    if symbol == "MES" and in_news_window(now_et):
-        if state["position"] != 0:
-            state["position"] = 0
-            state["entry_price"] = None
-            print("[RISK] Flatten pre-noticia")
-        return {"ok": False, "reason": "news_block"}
-
-    # 6) Solo operar dentro de RTH
+    # 5) Sólo operar dentro de RTH (para MES)
     if symbol == "MES" and not in_rth(now_et):
         return {"ok": False, "reason": "outside_rth"}
 
-    # 7) Caps diarios
+    # 6) Daily caps
     if symbol == "MES":
         if state["daily_pnl"] <= DAILY_STOP:
             return {"ok": False, "reason": "daily_stop_reached"}
         if state["daily_pnl"] >= DAILY_TAKE:
             return {"ok": False, "reason": "daily_take_reached"}
 
-    # 8) Deduplicación por barra
+    # 7) Dedupe (por barra/tiempo que manda TV)
     key = f"{symbol}|{signal}|{tstr}"
     if key in state["last_keys"]:
         return {"ok": False, "reason": "duplicate"}
     state["last_keys"].add(key)
 
-    # 9) Ejecución
+    # 8) Ejecución y PnL simulado
     exec_info = {"mode": "paper" if PAPER_MODE else "live"}
+
     if signal == "buy":
         if state["position"] < 1:
+            # cerrar short -> actualizar PnL
             if state["position"] == -1 and price:
-                pnl = (state.get("entry_price", price) - price) * 5.0
+                pnl = (state.get("entry_price", price) - price) * 5.0  # MES $5/tick aprox (ajústalo si prefieres)
                 state["daily_pnl"] += pnl
             state["position"] = 1
             state["entry_price"] = price
             if not PAPER_MODE:
-                exec_info = place_tradovate_order("MES", "buy", 1, price)
+                exec_info = place_order(symbol, "buy", 1, price)
 
     elif signal == "sell":
         if state["position"] > -1:
+            # cerrar long -> actualizar PnL
             if state["position"] == 1 and price:
                 pnl = (price - state.get("entry_price", price)) * 5.0
                 state["daily_pnl"] += pnl
             state["position"] = -1
             state["entry_price"] = price
             if not PAPER_MODE:
-                exec_info = place_tradovate_order("MES", "sell", 1, price)
+                exec_info = place_order(symbol, "sell", 1, price)
+
     else:
         return {"ok": False, "reason": "invalid_signal", "got": signal}
 
@@ -246,19 +163,50 @@ async def webhook_tv(request: Request):
         "signal": signal,
         "price": price,
         "state": {
+            "enabled": state["enabled"],
             "position": state["position"],
+            "entry_price": state["entry_price"],
             "daily_pnl": round(state["daily_pnl"], 2),
             "date": str(state["date"]),
         },
         "exec": exec_info
     }
 
-# ===================== STARTUP =====================
-@app.on_event("startup")
-async def startup_event():
-    print("[INIT] Cargando noticias iniciales...")
-    try:
-        refresh_news()
-    except Exception as e:
-        print("[INIT] Error inicializando noticias:", str(e))
-        state["news_windows"] = []
+# ---- Switch ON/OFF protegido con token simple (opcional) ----
+def _check_admin_token(x_token: str | None):
+    if ADMIN_TOKEN and (x_token or "") != ADMIN_TOKEN:
+        raise HTTPException(status_code=401, detail="invalid admin token")
+
+@app.post("/enable")
+def enable_bot(x_admin_token: str | None = Header(default=None, convert_underscores=False)):
+    _check_admin_token(x_admin_token)
+    state["enabled"] = True
+    return {"ok": True, "enabled": True}
+
+@app.post("/disable")
+def disable_bot(x_admin_token: str | None = Header(default=None, convert_underscores=False)):
+    _check_admin_token(x_admin_token)
+    state["enabled"] = False
+    return {"ok": True, "enabled": False}
+
+# ---- Status / Health ----
+@app.get("/health")
+def health():
+    return {
+        "status": "ok",
+        "enabled": state["enabled"],
+        "paper_mode": PAPER_MODE,
+        "rth": {"start": RTH_START, "end": RTH_END, "tz": str(TZ)},
+        "caps": {"daily_stop": DAILY_STOP, "daily_take": DAILY_TAKE},
+        "state": {
+            "date": str(state["date"]),
+            "position": state["position"],
+            "entry_price": state["entry_price"],
+            "daily_pnl": round(state["daily_pnl"], 2),
+            "last_hb": state["last_hb"].isoformat() if state["last_hb"] else None
+        }
+    }
+
+@app.get("/")
+def home():
+    return {"status": "ok", "msg": "FT middleware running"}
