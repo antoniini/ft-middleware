@@ -6,30 +6,31 @@ from zoneinfo import ZoneInfo
 app = FastAPI()
 
 # ===================== CONFIG =====================
-WHITELIST   = set((os.getenv("WHITELIST", "MES,ETHUSDT")).split(","))  # símbolos permitidos
+# Puedes sobreescribir con variables de entorno en Render → Environment
+WHITELIST   = set((os.getenv("WHITELIST", "CME_MINI:MES1!,MES,ETHUSDT")).split(","))
 TZ          = ZoneInfo(os.getenv("TZ", "US/Eastern"))
-RTH_START   = os.getenv("RTH_START", "09:30")  # HH:MM (ET) - inicio de RTH MES
-RTH_END     = os.getenv("RTH_END", "15:45")    # HH:MM (ET) - fin de RTH MES
-DAILY_STOP  = float(os.getenv("DAILY_STOP", "-500"))  # stop diario simulado
-DAILY_TAKE  = float(os.getenv("DAILY_TAKE", "250"))   # take diario simulado
+RTH_START   = os.getenv("RTH_START", "09:30")   # HH:MM (ET) MES RTH
+RTH_END     = os.getenv("RTH_END", "15:45")     # HH:MM (ET) MES RTH
+DAILY_STOP  = float(os.getenv("DAILY_STOP", "-500"))
+DAILY_TAKE  = float(os.getenv("DAILY_TAKE", "250"))
 PAPER_MODE  = os.getenv("PAPER_MODE", "true").lower() == "true"
 
-# Protección simple para /enable y /disable (opcional). Déjalo vacío si no quieres token.
+# Token opcional para /enable y /disable. Si está vacío, NO se valida.
 ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "")
 
 # ===================== STATE =====================
 state = {
-    "enabled": True,           # << switch maestro: ON/OFF
+    "enabled": True,        # << switch maestro ON/OFF
     "date": None,
     "daily_pnl": 0.0,
-    "position": 0,             # -1 short, 0 flat, 1 long
+    "position": 0,          # -1 short, 0 flat, 1 long
     "entry_price": None,
-    "last_keys": set(),        # dedupe por (symbol|signal|time)
-    "last_hb": None,           # último heartbeat recibido
+    "last_keys": set(),     # dedupe por (symbol|signal|time)
+    "last_hb": None,        # último heartbeat recibido
 }
 
 # ===================== HELPERS =====================
-def in_rth(now_et: dt.datetime):
+def in_rth(now_et: dt.datetime) -> bool:
     s_h, s_m = map(int, RTH_START.split(":"))
     e_h, e_m = map(int, RTH_END.split(":"))
     t = now_et.time()
@@ -50,8 +51,8 @@ def price_to_float(x):
     except:
         return None
 
-def maybe_flatten_eod(now_et: dt.datetime):
-    """Cierra todo entre 15:44–15:45 ET (seguridad)."""
+def maybe_flatten_eod(now_et: dt.datetime) -> bool:
+    """Cierra toda posición entre 15:44–15:45 ET (seguridad)."""
     if state.get("position") != 0 and dt.time(15, 44) <= now_et.time() <= dt.time(15, 45):
         state["position"] = 0
         state["entry_price"] = None
@@ -63,26 +64,27 @@ def maybe_flatten_eod(now_et: dt.datetime):
 def update_heartbeat(now_et: dt.datetime):
     state["last_hb"] = now_et
 
-def heartbeat_ok(now_et: dt.datetime, max_minutes=10):
+def heartbeat_ok(now_et: dt.datetime, max_minutes=10) -> bool:
     hb = state.get("last_hb")
     if hb is None:
         return True
     return (now_et - hb) <= dt.timedelta(minutes=max_minutes)
 
 def _require_admin(x_token: str | None):
+    # si ADMIN_TOKEN está vacío, no exigimos header
     if ADMIN_TOKEN and (x_token or "") != ADMIN_TOKEN:
         raise HTTPException(status_code=401, detail="invalid admin token")
 
-# ===================== EXECUTION STUB =====================
+# ===================== EJECUCIÓN (stub) =====================
 def place_order(symbol: str, side: str, qty: int, price: float | None = None):
-    """Aquí conectarías Tradovate real. Por ahora solo loguea."""
+    """Conectar aquí a Tradovate para live. Ahora solo imprime."""
     print(f"[EXEC] {side.upper()} {qty} {symbol} @ {price or 'MKT'} | mode={'paper' if PAPER_MODE else 'live'}")
     return {"ok": True, "orderId": "sim-001"}
 
 # ===================== ENDPOINTS =====================
 @app.post("/webhook/tv")
 async def webhook_tv(request: Request):
-    # Intentamos JSON; si no, tratamos body como texto ("buy"/"sell")
+    # Intentar JSON; si no, tomar body como texto (buy/sell)
     raw = (await request.body()).decode("utf-8", "ignore").strip()
     try:
         data = await request.json()
@@ -101,48 +103,48 @@ async def webhook_tv(request: Request):
     if not state["enabled"]:
         return {"ok": False, "reason": "disabled"}
 
-    # 1) Símbolos permitidos
+    # 1) Permitir solo símbolos whitelisted
     if symbol not in WHITELIST:
         return {"ok": False, "reason": "symbol_not_allowed", "symbol": symbol}
 
-    # 2) Reset diario
-    if symbol == "MES":
+    # 2) Reset diario y reglas específicas para MES (futuros)
+    if symbol in ("MES", "CME_MINI:MES1!"):
         reset_if_new_day(now_et)
 
-    # 3) EOD flatten
-    if symbol == "MES" and maybe_flatten_eod(now_et):
-        return {"ok": False, "reason": "eod_flatten"}
+        # EOD flatten forzoso
+        if maybe_flatten_eod(now_et):
+            return {"ok": False, "reason": "eod_flatten"}
 
-    # 4) Heartbeat (si TV deja de mandar, frenamos)
-    if symbol == "MES" and not heartbeat_ok(now_et, max_minutes=10):
-        return {"ok": False, "reason": "heartbeat_timeout"}
+        # Heartbeat: si TV se “muere”, paramos
+        if not heartbeat_ok(now_et, max_minutes=10):
+            return {"ok": False, "reason": "heartbeat_timeout"}
 
-    # 5) Solo RTH para MES
-    if symbol == "MES" and not in_rth(now_et):
-        return {"ok": False, "reason": "outside_rth"}
+        # Solo RTH
+        if not in_rth(now_et):
+            return {"ok": False, "reason": "outside_rth"}
 
-    # 6) Daily caps simulados
-    if symbol == "MES":
+        # Límites diarios (simulados)
         if state["daily_pnl"] <= DAILY_STOP:
             return {"ok": False, "reason": "daily_stop_reached"}
         if state["daily_pnl"] >= DAILY_TAKE:
             return {"ok": False, "reason": "daily_take_reached"}
 
-    # 7) Dedupe por (symbol|signal|time)
+    # 3) Dedupe por (symbol|signal|time)
     key = f"{symbol}|{signal}|{tstr}"
     if key in state["last_keys"]:
         return {"ok": False, "reason": "duplicate"}
     state["last_keys"].add(key)
 
-    # 8) Ejecución + PnL simulado (tick MES: aprox $5 por punto en micro -> ajusta si quieres)
+    # 4) Ejecución + PnL simulado (multiplicador aproximado)
     exec_info = {"mode": "paper" if PAPER_MODE else "live"}
+    point_mult = 5.0  # ajusta si quieres otra convención
 
     if signal == "buy":
         if state["position"] < 1:
             if state["position"] == -1 and price:
-                pnl = (state.get("entry_price", price) - price) * 5.0
+                pnl = (state.get("entry_price", price) - price) * point_mult
                 state["daily_pnl"] += pnl
-            state["position"] = 1
+            state["position"]  = 1
             state["entry_price"] = price
             if not PAPER_MODE:
                 exec_info = place_order(symbol, "buy", 1, price)
@@ -150,12 +152,13 @@ async def webhook_tv(request: Request):
     elif signal == "sell":
         if state["position"] > -1:
             if state["position"] == 1 and price:
-                pnl = (price - state.get("entry_price", price)) * 5.0
+                pnl = (price - state.get("entry_price", price)) * point_mult
                 state["daily_pnl"] += pnl
-            state["position"] = -1
+            state["position"]  = -1
             state["entry_price"] = price
             if not PAPER_MODE:
                 exec_info = place_order(symbol, "sell", 1, price)
+
     else:
         return {"ok": False, "reason": "invalid_signal", "got": signal}
 
@@ -174,7 +177,7 @@ async def webhook_tv(request: Request):
         "exec": exec_info
     }
 
-# ---- Encender/Apagar ----
+# ---- ON / OFF (si ADMIN_TOKEN está vacío, no se exige header) ----
 @app.post("/enable")
 def enable_bot(x_admin_token: str | None = Header(default=None, convert_underscores=False)):
     _require_admin(x_admin_token)
